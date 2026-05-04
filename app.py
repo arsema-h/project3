@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 app = Flask(__name__)
 DB = "jwks.db"
 
+# Argon2 configuration
 ph = PasswordHasher(
     time_cost=3,
     memory_cost=65536,
@@ -17,42 +18,17 @@ ph = PasswordHasher(
     salt_len=16
 )
 
+# Rate limiter settings
 rate_limit = {}
 MAX_REQUESTS = 10
 WINDOW = 1
 
 
+# ---------------- DATABASE ---------------- #
 def get_db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def get_aes_key():
-    key = os.environ.get("NOT_MY_KEY")
-    if not key:
-        raise RuntimeError("Missing NOT_MY_KEY environment variable")
-
-    key_bytes = key.encode()
-
-    if len(key_bytes) not in [16, 24, 32]:
-        key_bytes = key_bytes.ljust(32, b"0")[:32]
-
-    return key_bytes
-
-
-def encrypt_private_key(private_key_pem):
-    aesgcm = AESGCM(get_aes_key())
-    nonce = os.urandom(12)
-    ciphertext = aesgcm.encrypt(nonce, private_key_pem.encode(), None)
-    return nonce.hex(), ciphertext.hex()
-
-
-def decrypt_private_key(nonce_hex, ciphertext_hex):
-    aesgcm = AESGCM(get_aes_key())
-    nonce = bytes.fromhex(nonce_hex)
-    ciphertext = bytes.fromhex(ciphertext_hex)
-    return aesgcm.decrypt(nonce, ciphertext, None).decode()
 
 
 def init_db():
@@ -94,16 +70,44 @@ def init_db():
     conn.close()
 
 
+# ---------------- AES ENCRYPTION ---------------- #
+def get_aes_key():
+    key = os.environ.get("NOT_MY_KEY")
+    if not key:
+        raise RuntimeError("Missing NOT_MY_KEY environment variable")
+
+    key_bytes = key.encode()
+
+    # Ensure valid AES key length
+    if len(key_bytes) not in [16, 24, 32]:
+        key_bytes = key_bytes.ljust(32, b"0")[:32]
+
+    return key_bytes
+
+
+def encrypt_private_key(private_key):
+    aesgcm = AESGCM(get_aes_key())
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, private_key.encode(), None)
+    return nonce.hex(), ciphertext.hex()
+
+
+def decrypt_private_key(nonce_hex, ciphertext_hex):
+    aesgcm = AESGCM(get_aes_key())
+    nonce = bytes.fromhex(nonce_hex)
+    ciphertext = bytes.fromhex(ciphertext_hex)
+    return aesgcm.decrypt(nonce, ciphertext, None).decode()
+
+
+# ---------------- RATE LIMIT ---------------- #
 def check_rate_limit(ip):
     now = time.time()
 
     if ip not in rate_limit:
         rate_limit[ip] = []
 
-    rate_limit[ip] = [
-        timestamp for timestamp in rate_limit[ip]
-        if now - timestamp < WINDOW
-    ]
+    # remove old timestamps
+    rate_limit[ip] = [t for t in rate_limit[ip] if now - t < WINDOW]
 
     if len(rate_limit[ip]) >= MAX_REQUESTS:
         return False
@@ -112,6 +116,14 @@ def check_rate_limit(ip):
     return True
 
 
+# ---------------- ROUTES ---------------- #
+
+@app.route("/")
+def home():
+    return "JWKS Server Running"
+
+
+# USER REGISTRATION
 @app.route("/register", methods=["POST"])
 def register():
     data = request.get_json()
@@ -143,6 +155,7 @@ def register():
         return jsonify({"error": "username or email already exists"}), 409
 
 
+# AUTHENTICATION
 @app.route("/auth", methods=["POST"])
 def auth():
     request_ip = request.remote_addr
@@ -171,16 +184,16 @@ def auth():
 
     try:
         ph.verify(user["password_hash"], password)
-    except:
+    except Exception:
         conn.close()
         return jsonify({"error": "Invalid credentials"}), 401
 
+    # Update last login
     cur.execute("""
-    UPDATE users
-    SET last_login = CURRENT_TIMESTAMP
-    WHERE id = ?
+    UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?
     """, (user["id"],))
 
+    # Log successful authentication
     cur.execute("""
     INSERT INTO auth_logs (request_ip, user_id)
     VALUES (?, ?)
@@ -192,21 +205,32 @@ def auth():
     return jsonify({"message": "Authentication successful"}), 200
 
 
-@app.route("/logs", methods=["GET"])
-def logs():
+# DEMO: STORE ENCRYPTED PRIVATE KEY
+@app.route("/store-key", methods=["POST"])
+def store_key():
+    data = request.get_json()
+
+    if not data or "private_key" not in data or "kid" not in data:
+        return jsonify({"error": "private_key and kid required"}), 400
+
+    private_key = data["private_key"]
+    kid = data["kid"]
+    exp = int(time.time()) + 3600
+
+    nonce, encrypted_key = encrypt_private_key(private_key)
+
     conn = get_db()
     cur = conn.cursor()
 
-    rows = cur.execute("""
-    SELECT auth_logs.id, request_ip, request_timestamp, username
-    FROM auth_logs
-    LEFT JOIN users ON auth_logs.user_id = users.id
-    ORDER BY request_timestamp DESC
-    """).fetchall()
+    cur.execute("""
+    INSERT INTO keys (kid, key, iv, exp)
+    VALUES (?, ?, ?, ?)
+    """, (kid, encrypted_key, nonce, exp))
 
+    conn.commit()
     conn.close()
 
-    return jsonify([dict(row) for row in rows])
+    return jsonify({"message": "Key stored securely"}), 201
 
 
 if __name__ == "__main__":
